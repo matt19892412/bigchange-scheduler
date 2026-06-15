@@ -4,7 +4,7 @@ import time
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
@@ -58,18 +58,6 @@ def bc_get(path, params=None):
     resp.raise_for_status()
     return resp.json()
 
-def bc_put(path, body):
-    token = get_token()
-    resp = requests.put(f'{API_BASE}{path}', headers={
-        'Authorization': f'Bearer {token}',
-        'Content-Type': 'application/json',
-        'customer-id': CUSTOMER_ID,
-    }, json=body, timeout=15)
-    print(f"[PUT] {resp.status_code}: {resp.text[:200]}")
-    resp.raise_for_status()
-    try: return resp.json()
-    except: return {}
-
 def fetch_paged(params):
     all_items = []
     page = 1
@@ -117,8 +105,6 @@ def format_job(j):
         'resourceName':    j.get('resourceName') or '',
         'startTime':       j.get('actualStartAt') or j.get('plannedStartAt'),
         'endTime':         j.get('actualEndAt') or j.get('plannedEndAt'),
-        'actualStart':     j.get('actualStartAt'),
-        'statusModifiedAt': j.get('statusModifiedAt'),
         'durationMins':    get_duration_minutes(j),
         'lat':             loc.get('latitude'),
         'lng':             loc.get('longitude'),
@@ -136,46 +122,21 @@ def api_status():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@app.route('/api/engineers')
-def get_engineers():
-    try:
-        data = bc_get('/resources', {'pageSize': 200})
-        raw = data if isinstance(data, list) else (data.get('items') or [])
-        engineers = []
-        for i, e in enumerate(raw):
-            name = e.get('name') or f"{e.get('firstName','')} {e.get('lastName','')}".strip() or 'Engineer'
-            if is_group_entry(name): continue
-            if e.get('type', '').lower() in ['vehicle', 'asset']: continue
-            is_trainee = '(T)' in name or '(TS)' in name
-            engineers.append({
-                'id':        str(e.get('id') or i),
-                'name':      name.replace('(T)', '').replace('(TS)', '').strip(),
-                'isTrainee': is_trainee,
-                'region':    e.get('region') or e.get('homePostcode') or '—',
-            })
-        return jsonify({'engineers': engineers, 'total': len(engineers)})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/jobs/unassigned')
 def get_unassigned_jobs():
     try:
         cached = cache_get('unassigned_jobs', max_age=120)
         if cached is not None:
-            print(f"[UNASSIGNED] Cache hit: {len(cached)} jobs")
             return jsonify({'jobs': cached, 'total': len(cached)})
 
         all_raw = []
         seen_ids = set()
-
-        # Use a wide date window to catch all unassigned jobs
-        # Jobs can sit unassigned for months so look back 180 days
         from_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%dT00:00:00')
         to_date   = (datetime.now() + timedelta(days=90)).strftime('%Y-%m-%dT23:59:59')
 
         for status_val in ['new', 'unscheduled']:
             page = 1
-            while page <= 5:  # max 5000 jobs per status
+            while page <= 5:
                 try:
                     data = bc_get('/jobs', {
                         'StatusModifiedAtFrom': from_date,
@@ -188,15 +149,12 @@ def get_unassigned_jobs():
                     new_items = [j for j in items if j.get('id') not in seen_ids]
                     seen_ids.update(j.get('id') for j in new_items)
                     all_raw.extend(new_items)
-                    print(f"[UNASSIGNED] status={status_val} page={page}: {len(items)} jobs")
                     if len(items) < 1000:
                         break
                     page += 1
                 except Exception as e:
                     print(f"[UNASSIGNED] status={status_val} page={page} failed: {e}")
                     break
-
-        print(f"[UNASSIGNED] Total fetched: {len(all_raw)}")
 
         jobs = []
         for j in all_raw:
@@ -205,12 +163,45 @@ def get_unassigned_jobs():
             jobs.append(format_job(j))
 
         jobs.sort(key=lambda j: -j['durationMins'])
-        print(f"[UNASSIGNED] Returning {len(jobs)} jobs")
         cache_set('unassigned_jobs', jobs)
         return jsonify({'jobs': jobs, 'total': len(jobs)})
 
     except Exception as e:
         print(f"[UNASSIGNED] ERROR: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/schedule/today')
+def get_today_schedule():
+    try:
+        cached = cache_get('schedule_today', max_age=30)
+        if cached:
+            return jsonify(cached)
+
+        today = datetime.now()
+        raw = fetch_paged({
+            'plannedAtFrom': today.strftime('%Y-%m-%dT00:00:00'),
+            'plannedAtTo':   today.strftime('%Y-%m-%dT23:59:59'),
+        })
+
+        by_engineer = {}
+        eng_names = {}
+        for j in raw:
+            rid = str(j.get('resourceId') or '')
+            if not rid: continue
+            job = format_job(j)
+            by_engineer.setdefault(rid, []).append(job)
+            if job['resourceName']:
+                eng_names[rid] = job['resourceName']
+
+        for rid in by_engineer:
+            by_engineer[rid].sort(key=lambda j: j['startTime'] or '99:99')
+
+        result = {'byEngineer': by_engineer, 'engNames': eng_names, 'date': today.strftime('%Y-%m-%d')}
+        cache_set('schedule_today', result)
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[TODAY] ERROR: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/schedule/tomorrow')
@@ -225,7 +216,6 @@ def get_tomorrow_schedule():
             'plannedAtFrom': tomorrow.strftime('%Y-%m-%dT00:00:00'),
             'plannedAtTo':   tomorrow.strftime('%Y-%m-%dT23:59:59'),
         })
-        print(f"[TOMORROW] Got {len(raw)} jobs")
 
         by_engineer = {}
         eng_names = {}
@@ -249,44 +239,22 @@ def get_tomorrow_schedule():
         print(f"[TOMORROW] ERROR: {e}")
         return jsonify({'error': str(e)}), 500
 
-@app.route('/api/schedule/today')
-def get_today_schedule():
-    try:
-        cached = cache_get('schedule_today', max_age=30)
-        if cached:
-            return jsonify(cached)
-
-        today = datetime.now()
-        raw = fetch_paged({
-            'plannedAtFrom': today.strftime('%Y-%m-%dT00:00:00'),
-            'plannedAtTo':   today.strftime('%Y-%m-%dT23:59:59'),
-        })
-        print(f"[TODAY] Got {len(raw)} jobs")
-
-        by_engineer = {}
-        eng_names = {}
-        for j in raw:
-            rid = str(j.get('resourceId') or '')
-            if not rid: continue
-            job = format_job(j)
-            by_engineer.setdefault(rid, []).append(job)
-            if job['resourceName']:
-                eng_names[rid] = job['resourceName']
-
-        for rid in by_engineer:
-            by_engineer[rid].sort(key=lambda j: j['startTime'] or '99:99')
-
-        result = {'byEngineer': by_engineer, 'engNames': eng_names, 'date': today.strftime('%Y-%m-%d')}
-        cache_set('schedule_today', result)
-        return jsonify(result)
-
-    except Exception as e:
-        print(f"[TODAY] ERROR: {e}")
-        return jsonify({'error': str(e)}), 500
+def bc_put(path, body):
+    token = get_token()
+    resp = requests.put(f'{API_BASE}{path}', headers={
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+        'customer-id': CUSTOMER_ID,
+    }, json=body, timeout=15)
+    print(f"[PUT] {resp.status_code}: {resp.text[:200]}")
+    resp.raise_for_status()
+    try: return resp.json()
+    except: return {}
 
 @app.route('/api/jobs/<job_id>/assign', methods=['POST'])
 def assign_job(job_id):
     try:
+        from flask import request
         body = request.get_json()
         resource_id   = body.get('resourceId')
         planned_start = body.get('plannedStart')
@@ -302,45 +270,6 @@ def assign_job(job_id):
         return jsonify({'success': True, 'result': result})
     except Exception as e:
         print(f"[ASSIGN] ERROR: {e}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/jobs/<job_id>/constraints', methods=['GET'])
-def get_job_constraints(job_id):
-    try:
-        data  = bc_get(f'/jobs/{job_id}/constraints', {'pageSize': 100})
-        items = data if isinstance(data, list) else (data.get('items') or [])
-        constraints = [{'type': c.get('type'), 'constraintAt': c.get('constraintAt'), 'entityId': c.get('entityId')} for c in items]
-        return jsonify({'constraints': constraints})
-    except Exception as e:
-        return jsonify({'constraints': [], 'error': str(e)})
-
-@app.route('/api/debug/category-ids')
-def get_category_ids():
-    try:
-        from_date = (datetime.now() - timedelta(days=14)).strftime('%Y-%m-%dT00:00:00')
-        to_date   = (datetime.now() + timedelta(days=90)).strftime('%Y-%m-%dT23:59:59')
-        all_raw = []
-        for status_val in ['new', 'unscheduled']:
-            try:
-                data = bc_get('/jobs', {
-                    'StatusModifiedAtFrom': from_date,
-                    'StatusModifiedAtTo':   to_date,
-                    'status':               status_val,
-                    'pageSize':             1000,
-                })
-                # Note: BigChange API doesn't support categoryId filter directly
-                # so we filter after fetching
-                items = data if isinstance(data, list) else (data.get('items') or [])
-                all_raw.extend(items)
-            except: pass
-        cats = {}
-        for j in all_raw:
-            name = j.get('categoryName') or 'none'
-            cid  = j.get('categoryId')
-            if name not in cats:
-                cats[name] = cid
-        return jsonify({'categories': cats})
-    except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
